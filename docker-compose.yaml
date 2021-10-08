@@ -1,0 +1,166 @@
+version: '3'
+
+networks:
+  net_traefik:
+    name: net_traefik
+    driver: bridge
+
+services:
+
+#----------------------------------------------------------------------------------
+# reverse proxy
+#----------------------------------------------------------------------------------
+  gateway:
+    image: danielporto/traefik:latest
+    build:
+      context: ./traefik
+      dockerfile: Dockerfile
+      args:
+        DEPLOYMENT_TYPE: "dev"
+        TRAEFIK_BASE: "v2.5"
+    restart: unless-stopped
+    networks:
+      - net_traefik
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dev/traefik.yaml:/etc/traefik/traefik.yaml
+      - ./traefik/dev/dynamic.yaml:/etc/traefik/dynamic.yaml
+      - ./traefik/logs:/var/logs/traefik
+      - ./certs:/certs
+    security_opt:
+      - no-new-privileges=true # https://docs.docker.com/engine/reference/run/#security-configuration      
+    environment:
+      - TRAEFIK_PASSWORD_HASH
+      - TRAEFIK_USER
+      - DOMAIN
+
+# #----------------------------------------------------------------------------------
+# # light logviewer service
+# #----------------------------------------------------------------------------------
+
+#   dozzle:
+#     image: amir20/dozzle:latest
+#     command: --no-analytics
+#     volumes:
+#       - /var/run/docker.sock:/var/run/docker.sock
+#     environment:
+#       - DOZZLE_LEVEL
+#       - DOZZLE_TAILSIZE
+#       - DOZZLE_AUTH
+#       - DOMAIN
+#     networks:
+#       - net_traefik
+#     labels:
+#       - traefik.enable=true
+#       - traefik.docker.network=net_traefik  # required when container connects to more than one network
+#       - traefik.http.services.to-dozzle.loadbalancer.server.port=8080
+#       - traefik.http.routers.to-dozzle.rule=Host(`logs.${DOMAIN}`)
+#       - traefik.http.routers.to-dozzle.tls=true
+#       - traefik.http.routers.to-dozzle.entrypoints=websecure
+#       - traefik.http.routers.to-dozzle.middlewares=to-dozzle-handler
+#       - traefik.http.middlewares.to-dozzle-handler.chain.middlewares=to-dozzle-auth
+#       - traefik.http.middlewares.to-dozzle-auth.basicauth.users=${DOZZLE_AUTH}
+
+#==================================================================================
+# Fake email for development/testing
+#==================================================================================
+# https://github.com/mailhog/MailHog
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    # ports:
+    #    - 1025:1025 # smtp server
+    #    - 8025:8025 # web ui
+    networks:
+      net_traefik:
+        aliases:
+          - smtp.${DOMAIN}
+
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=net_traefik  # required when container connects to more than one network
+      - traefik.http.routers.mailhog.service=mailhog
+      - traefik.http.services.mailhog.loadbalancer.server.port=8025
+      - traefik.http.routers.mailhog.rule=Host(`webmail.${DOMAIN}`)
+      - traefik.http.routers.mailhog.tls=true
+      - traefik.http.routers.mailhog.entrypoints=websecure
+      # traefik smtp proxy was disabled. instead we use the network alias above.
+      # doesnt work(not http needs specific traefik config): 
+      # - traefik.XXXX.routers.smtp.entrypoints=email
+      # - traefik.XXXX.routers.smtp.rule=Host(`smtp.${DOMAIN}`)
+      # - traefik.XXXX.routers.smtp.service=smtp
+      # - traefik.XXXX.services.smtp.loadbalancer.server.port=1025
+
+#----------------------------------------------------------------------------------
+# bitwarden service
+#----------------------------------------------------------------------------------
+  bitwarden:
+    image: vaultwarden/server:latest
+    volumes:
+      - ./data/bitwarden:/data
+    restart: on-failure
+    environment:
+      WEBSOCKET_ENABLED: 'true'
+      SIGNUPS_ALLOWED: 'true'
+      INVITATIONS_ALLOWED: 'true'
+      INVITATION_ORG_NAME: 'ORG|PORTO'
+      ADMIN_TOKEN: 'very_secret'
+      SMTP_HOST: 'smtp.${DOMAIN}'  # look at mailhog network alias config
+      SMTP_FROM: 'bitwarden@${DOMAIN}'
+      SMTP_FROM_NAME: 'ORG|PORTO'
+      SMTP_PORT: 1025 # look at mailhog container
+      SMTP_SSL: 'false'
+      SMTP_EXPLICIT_TLS: 'false'
+      SMTP_USERNAME: vaultwarden
+      SMTP_PASSWORD: password
+      SMTP_TIMEOUT: 15
+      DOMAIN: 'https://bitwarden.${DOMAIN}'  #bitwarden domain var must override the actual domain
+
+    logging:
+      driver: "json-file"
+    networks:
+      - net_traefik
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=net_traefik  # required when container connects to more than one network
+      - traefik.http.routers.to-bitwarden.service=bitwarden-webui
+      - traefik.http.services.bitwarden-webui.loadbalancer.server.port=80
+      - traefik.http.routers.to-bitwarden.rule=Host(`bitwarden.${DOMAIN}`)
+      - traefik.http.routers.to-bitwarden.tls=true
+      - traefik.http.routers.to-bitwarden.entrypoints=websecure
+
+      - traefik.http.routers.to-bitwarden-websocket.service=bitwarden-websocket
+      - traefik.http.services.bitwarden-websocket.loadbalancer.server.port=3012
+      - traefik.http.routers.to-bitwarden-websocket.rule=Host(`bitwarden.${DOMAIN}`)  && Path(`/notifications/hub`)
+      - traefik.http.routers.to-bitwarden-websocket.tls=true
+      - traefik.http.routers.to-bitwarden-websocket.entrypoints=websecure
+
+      # - traefik.http.routers.to-bitwarden.middlewares=to-bitwarden-handler
+      # - traefik.http.middlewares.to-bitwarden-handler.chain.middlewares=to-bitwarden-auth
+      # - traefik.http.middlewares.to-bitwarden-auth.basicauth.users=${BITWARDEN_AUTH}
+     
+ 
+  bw_backup:
+    image: bruceforce/bw_backup:latest
+    container_name: bw_backup
+    restart: on-failure
+    depends_on:
+      - bitwarden
+    networks:
+      - net_traefik
+    volumes:
+      - ./data/bitwarden:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./data/bitwarden:/backup_folder/
+    environment:
+      - DB_FILE=/data/db.sqlite3
+      - BACKUP_FILE=/backup_folder/db_backup/backup.sqlite3
+      - BACKUP_FILE=/data/db_backup/backup.sqlite3
+      - CRON_TIME=0 5 * * *
+      - TIMESTAMP=false
+      - UID=0
+      - GID=0
